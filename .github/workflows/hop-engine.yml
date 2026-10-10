@@ -1,0 +1,93 @@
+name: HOP engine validation
+
+# Fork-only validation lane for mytrashcan/rhwp.
+#
+# It deliberately never lives on a branch that is proposed upstream. Upstream
+# treats any `.github/workflows/**` change coming from a fork as an
+# enforcement-surface change (CI impact policy `fail-closed:untrusted-enforcement-change`),
+# and its metadata-only push-subscriber guard only allows `refresh-nextest-duration.yml`
+# and `close-issues-on-devel-push.yml` to subscribe to non-main pushes. A workflow
+# file on the proposed branch therefore blocks that pull request by construction.
+#
+# Dispatch against a ref in this fork:
+#   gh workflow run hop-engine.yml --repo mytrashcan/rhwp --ref ci/hop-validation \
+#     -f target_ref=fix/body-wide-square-table
+on:
+  push:
+    branches: [ci/hop-validation]
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch or SHA in this fork to validate
+        required: true
+        default: fix/body-wide-square-table
+      autofix:
+        description: Apply rustfmt and push the formatted sources back to target_ref
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref || github.ref_name }}
+          sparse-checkout: |
+            src
+            crates
+            vendor
+            tools
+            bindings/Native
+            saved
+            samples
+            tests
+            assets
+            ttfs
+            mydocs/manual
+            mydocs/tech/agent_roadmap
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check (renderer sources)
+        run: >-
+          rustfmt --edition 2021 --config skip_children=true --check
+          src/renderer/float_placement.rs
+          src/renderer/layout/shape_layout.rs
+          src/renderer/typeset.rs
+      - run: cargo check --locked -p rhwp --lib
+      - run: cargo clippy --locked -p rhwp --lib --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --locked -p rhwp --lib renderer::float_placement
+      - name: Apply rustfmt and push when requested
+        # Runs even when the format check failed: that is exactly the case this
+        # input exists for. Never triggers on the push lane.
+        if: ${{ always() && inputs.autofix }}
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rustfmt --edition 2021 --config skip_children=true \
+            src/renderer/float_placement.rs \
+            src/renderer/layout/shape_layout.rs \
+            src/renderer/typeset.rs
+          git add src/renderer/float_placement.rs src/renderer/layout/shape_layout.rs src/renderer/typeset.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "style(renderer): format validated downstream patch"
+            git push origin "HEAD:${TARGET_REF}"
+          else
+            echo "rustfmt produced no change."
+          fi
+      - run: cargo install wasm-pack --version 0.14.0 --locked
+      - run: wasm-pack build --target web --out-dir pkg --release -- --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rhwp-core
+          path: pkg
+          retention-days: 7
